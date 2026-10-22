@@ -37,19 +37,22 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Add the key for the provider you want to use to `.env`:
+Add the key for the provider you want to use to `.env`. Gemini is the recommended and preselected live provider; provider selection stays configurable:
 
 ```dotenv
 GROQ_API_KEY=your-key
 GROQ_MODEL=openai/gpt-oss-120b
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.5-flash-lite
+DEFAULT_LLM_PROVIDER=gemini
 LLM_MODE=mock
+MIN_USABLE_EVIDENCE=3
+MIN_UNIQUE_EVIDENCE_PMIDS=2
 NCBI_EMAIL=you@example.com
 NCBI_API_KEY=
 ```
 
-The sidebar lets you select Groq or Gemini and loads the models available to the configured API key. Set `GROQ_API_KEY` for Groq or `GEMINI_API_KEY` for Gemini; the matching model variable is optional in the UI. `LLM_MODE=mock` is the safe default; switch off **Mock/demo mode** and select a provider to run live model calls. For CLI use, set `LLM_MODE=groq` with `GROQ_MODEL`, or `LLM_MODE=gemini` with `GEMINI_MODEL`. Mock mode can demonstrate the interface and retrieve PubMed records, but it does not make real relevance or sufficiency judgments or generate a biomedical conclusion. NCBI credentials are optional; `NCBI_EMAIL` and `NCBI_API_KEY` are recommended for responsible API use and higher request limits.
+The sidebar lets you select Groq or Gemini and loads models available to the configured API key. Set the matching provider key. `LLM_MODE=mock` is the demo-safe default; switch off **Mock/demo mode** to run live calls, with Gemini selected by default. For CLI use, set `LLM_MODE=gemini` with `GEMINI_MODEL`, or `LLM_MODE=groq` with `GROQ_MODEL`. The deterministic early-stop gate requires the configured minimum usable excerpts and distinct PMIDs before asking the model whether evidence is sufficient. Mock mode retrieves records but makes no real relevance or sufficiency judgments and produces no biomedical conclusion. NCBI credentials are optional; `NCBI_EMAIL` and `NCBI_API_KEY` are recommended for responsible API use and higher request limits.
 
 Start the app:
 
@@ -74,11 +77,14 @@ python scripts/download_mesh.py
    GROQ_MODEL = "openai/gpt-oss-120b"
    GEMINI_API_KEY = "your-gemini-key"
    GEMINI_MODEL = "gemini-3.5-flash-lite"
+   DEFAULT_LLM_PROVIDER = "gemini"
    LLM_MODE = "mock"
+   MIN_USABLE_EVIDENCE = 3
+   MIN_UNIQUE_EVIDENCE_PMIDS = 2
    NCBI_EMAIL = "you@example.com"
    ```
 
-   The app reads these values from Community Cloud secrets. Add either or both provider keys. `gemini-3.5-flash-lite` is the preselected Gemini model for lower-cost, higher-volume use; choose another available ID in the sidebar if desired. Keep `LLM_MODE="mock"` if you want the demo to start in mock mode; turn off the mock toggle and select Groq or Gemini to use a live provider. Leave `NCBI_API_KEY` out if you do not have one.
+   The app reads these values from Community Cloud secrets. Add either or both provider keys. `DEFAULT_LLM_PROVIDER` sets the recommended live selection; `GEMINI_MODEL` and `GROQ_MODEL` can be changed in the sidebar. Keep `LLM_MODE="mock"` if you want the demo to start in mock mode; turn off the mock toggle to use the selected provider. Leave `NCBI_API_KEY` out if you do not have one.
 
 4. Deploy. No PubMed corpus or MeSH download is required. The app calls PubMed and, when live mode is selected, the configured Groq or Gemini provider at runtime. Without the selected provider's API key, use mock/demo mode.
 
@@ -87,12 +93,16 @@ See Streamlit's [deployment guide](https://docs.streamlit.io/deploy/streamlit-co
 ## How a run works
 
 1. **Plan and refine:** the LLM creates a PubMed query plan. In each enabled refinement round, the app retrieves preliminary records and asks the LLM to critique query coverage, alignment, and redundancy. Optional local MeSH data can validate or expand terms.
-2. **Retrieve and assess:** PubMed returns article IDs and abstracts. The LLM assesses each abstract individually and extracts a short passage. The app only accepts an extracted passage if it appears verbatim in that abstract. After a batch, the LLM can assess evidence sufficiency; early stopping also requires at least two distinct PMIDs.
-3. **Answer and inspect:** if accepted evidence exists, the LLM drafts a cited answer. Code checks that cited PMIDs belong to the retrieved evidence set. The UI exposes the records, excerpts, query history, termination reason, and usage details.
+2. **Retrieve and assess:** PubMed returns article IDs and abstracts. The LLM assesses each abstract individually and extracts a short passage. The app accepts an excerpt only when it matches the abstract belonging to that retrieved PMID. Before the model is asked to judge sufficiency, deterministic checks require the configured minimum excerpt count and unique source PMID count.
+3. **Answer and inspect:** the LLM drafts a cited answer. Code checks citation identifiers against accepted evidence and retrieved records. Citations are source-linked; claim-level entailment is not verified. The UI exposes the records, excerpts, query history, termination reason, provider/model, and usage details.
 
 There is no vector database or embedding-based nearest-neighbor search. PubMed performs the initial matching against its own index. The optional MeSH JSONL file is a terminology index, not a vector store.
 
-A run's model calls vary with the number of refinement rounds, abstracts assessed, sufficiency checks, and whether an answer is generated. **Maximum model calls** caps the run. The Run details view reports actual calls and token counts. PubMed requests are separate from model calls.
+A run's model calls vary with refinement rounds, abstracts assessed, sufficiency checks, and answer generation. **Maximum model calls** caps the run. Run details report provider, model, app-initiated generation calls, available token counts, latency, PubMed searches/requests, and cache hits. Provider SDK retries may create additional HTTP requests beyond the app-initiated call count. Output-token totals use the provider-reported definition; reasoning tokens may be included in that total. PubMed requests are separate from model calls. Provider-specific cost is reported as unavailable unless pricing is explicitly configured. Cached searches are keyed by the exact query and date filters; a larger result set can serve a smaller request for that same query, but not a different query.
+
+## Provider selection and observed runs
+
+Gemini is the demo's recommended default based on the project's latest user-observed run: 15.487 seconds, 10 LLM calls, and 3 accepted evidence excerpts, compared with an earlier Groq observation of 150.21 seconds, 23 calls, and zero accepted excerpts. These are individual observations under potentially different run conditions, not a controlled benchmark and not evidence of general model superiority. Earlier saved local traces also show variable outcomes across questions and runs. See `docs/EXPERIMENTS.md` for limitations. Groq remains supported; citation diagnostics now record inline/schema PMID mismatches, and a citation failure no longer erases accepted excerpts.
 
 ## Modes and comparisons
 
@@ -100,7 +110,7 @@ The sidebar lets you select the Full Reasoner, Standard RAG (single query), no s
 
 ## Benchmark evaluation
 
-PubMedQA is not bundled. Obtain the dataset from the [official PubMedQA repository](https://github.com/pubmedqa/pubmedqa). Evaluation requires real Groq predictions; mock mode is refused. The examples below show the expected workflow after placing an authorized labeled split under `data/evaluation/`:
+PubMedQA is not bundled. Obtain the dataset from the [official PubMedQA repository](https://github.com/pubmedqa/pubmedqa). The included evaluation scripts currently support Groq predictions; mock mode is refused. The examples below show the expected workflow after placing an authorized labeled split under `data/evaluation/`:
 
 ```bash
 python scripts/run_evaluation.py data/evaluation/<labeled-split>.json --limit 50 --seed 13 --methods full,standard_rag,direct_llm

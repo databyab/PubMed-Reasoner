@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     llm_mode: str = "mock"
+    default_llm_provider: str = "gemini"
     groq_api_key: str | None = None
     groq_model: str = ""
     gemini_api_key: str | None = None
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
     max_articles: int = Field(default=20, ge=1, le=500)
     max_refinement_rounds: int = Field(default=3, ge=0, le=10)
     max_llm_calls: int = Field(default=30, ge=1, le=500)
+    min_usable_evidence: int = Field(default=3, ge=1, le=50)
+    min_unique_evidence_pmids: int = Field(default=2, ge=1, le=50)
     output_dir: Path = Path("data/results")
     request_timeout: float = Field(default=30, gt=0, le=180)
     @model_validator(mode="after")
@@ -27,6 +30,8 @@ class Settings(BaseSettings):
             raise ValueError("GROQ_API_KEY is required in Groq mode")
         if self.llm_mode == "gemini" and not self.gemini_api_key:
             raise ValueError("GEMINI_API_KEY is required in Gemini mode")
+        if self.default_llm_provider not in {"groq", "gemini"}:
+            raise ValueError("DEFAULT_LLM_PROVIDER must be groq or gemini")
         return self
 
 settings = Settings()

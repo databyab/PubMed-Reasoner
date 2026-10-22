@@ -1,6 +1,7 @@
 .venv/
 .venv*/
 venv/
+tests/
 __pycache__/
 .pytest_cache/
 .env

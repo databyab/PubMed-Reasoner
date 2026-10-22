@@ -11,7 +11,7 @@ class LLMError(RuntimeError):
 
 class LLMProvider:
     mode = "abstract"
-    def __init__(self): self.calls=0; self.input_tokens=0; self.output_tokens=0
+    def __init__(self): self.calls=0; self.input_tokens=0; self.output_tokens=0; self.reasoning_tokens=0
     def generate_text(self, system: str, prompt: str) -> str: raise NotImplementedError
     def generate_structured_output(self, schema: Type[T], system: str, prompt: str) -> T:
         raw=self.generate_text(system + " Return one JSON object only. Required schema: " + schema.model_json_schema().__str__(),prompt)
@@ -20,7 +20,7 @@ class LLMProvider:
             return schema.model_validate_json(match.group(0) if match else raw)
         except Exception as exc: raise LLMError(f"Invalid {schema.__name__} response: {exc}") from exc
     def get_usage(self):
-        return {"calls":self.calls,"input_tokens":self.input_tokens,"output_tokens":self.output_tokens,"mode":self.mode}
+        return {"calls":self.calls,"request_count":self.calls,"request_count_scope":"provider generation calls initiated by the app; provider SDK retries may issue additional HTTP requests","input_tokens":self.input_tokens,"output_tokens":self.output_tokens,"output_tokens_scope":"provider-reported generated tokens; reasoning tokens may be included","reasoning_tokens":self.reasoning_tokens,"mode":self.mode}
 
 class GroqLLM(LLMProvider):
     mode="groq"
@@ -54,6 +54,8 @@ class GroqLLM(LLMProvider):
             if usage:
                 self.input_tokens+=getattr(usage,"prompt_tokens",0) or 0
                 self.output_tokens+=getattr(usage,"completion_tokens",0) or 0
+                details=getattr(usage,"completion_tokens_details",None)
+                self.reasoning_tokens+=getattr(details,"reasoning_tokens",0) or 0
             return result.choices[0].message.content or ""
         except Exception as exc:
             status=getattr(exc,"status_code",None)
@@ -67,6 +69,8 @@ class GroqLLM(LLMProvider):
             usage=result.usage
             if usage:
                 self.input_tokens+=getattr(usage,"prompt_tokens",0) or 0; self.output_tokens+=getattr(usage,"completion_tokens",0) or 0
+                details=getattr(usage,"completion_tokens_details",None)
+                self.reasoning_tokens+=getattr(details,"reasoning_tokens",0) or 0
             return schema.model_validate_json(result.choices[0].message.content or "")
         except Exception as exc:
             raise LLMError(f"Groq structured {schema.__name__} request/validation failed: {type(exc).__name__}") from exc
@@ -131,7 +135,10 @@ class GeminiLLM(LLMProvider):
             usage=getattr(result,"usage_metadata",None)
             if usage:
                 self.input_tokens+=getattr(usage,"prompt_token_count",0) or 0
-                self.output_tokens+=getattr(usage,"candidates_token_count",0) or 0
+                candidate_tokens=getattr(usage,"candidates_token_count",0) or 0
+                thought_tokens=getattr(usage,"thoughts_token_count",0) or 0
+                self.output_tokens+=candidate_tokens+thought_tokens
+                self.reasoning_tokens+=thought_tokens
             return result.text or ""
         except Exception as exc:
             raise LLMError(f"Gemini request failed ({type(exc).__name__}): {exc}") from exc

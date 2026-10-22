@@ -8,7 +8,7 @@ import streamlit as st
 # Community Cloud stores credentials in st.secrets. Copy supported values into
 # the environment before importing the shared settings used by the CLI/app.
 try:
-    for _key in ("GROQ_API_KEY", "GROQ_MODEL", "GEMINI_API_KEY", "GEMINI_MODEL", "LLM_MODE", "NCBI_EMAIL", "NCBI_API_KEY"):
+    for _key in ("GROQ_API_KEY", "GROQ_MODEL", "GEMINI_API_KEY", "GEMINI_MODEL", "LLM_MODE", "DEFAULT_LLM_PROVIDER", "MIN_USABLE_EVIDENCE", "MIN_UNIQUE_EVIDENCE_PMIDS", "NCBI_EMAIL", "NCBI_API_KEY"):
         if _key not in os.environ and _key in st.secrets:
             os.environ[_key] = str(st.secrets[_key])
 except (FileNotFoundError, ImportError):
@@ -43,7 +43,7 @@ def shared_pubmed_client():
 with st.sidebar:
     st.header("Run configuration")
     mock=st.toggle("Mock/demo mode",value=settings.llm_mode=="mock",help="Uses deterministic synthetic control logic and never reports live model output.")
-    provider_name=st.selectbox("Model provider",["Groq","Gemini"],index=1 if settings.llm_mode=="gemini" else 0,disabled=mock)
+    provider_name=st.selectbox("Model provider · Gemini recommended",["Groq","Gemini"],index=1 if settings.default_llm_provider=="gemini" else 0,disabled=mock)
     provider=provider_name.lower()
     active_models=[]
     if not mock:
@@ -63,6 +63,8 @@ with st.sidebar:
     batch_size=st.slider("Articles per batch",1,10,min(settings.batch_size,10))
     max_articles=st.slider("Maximum articles",1,50,min(settings.max_articles,50))
     llm_budget=st.slider("Maximum model calls",1,60,min(settings.max_llm_calls,60))
+    min_evidence=st.slider("Minimum accepted evidence excerpts",1,10,min(settings.min_usable_evidence,10))
+    min_sources=st.slider("Minimum unique source PMIDs",1,10,min(settings.min_unique_evidence_pmids,10))
     mesh_index_available=Path("data/mesh/descriptors.jsonl").exists()
     mesh_enabled=st.checkbox(
         "Validate and expand with local MeSH",
@@ -98,19 +100,20 @@ if run:
             status.info("Running direct-answer baseline…"); progress.progress(.3,text=f"{provider_name if not mock else 'Mock'} direct answer")
             data=run_baseline("direct_llm",question,llm=llm,context=context)
             runs=st.session_state.setdefault("comparison_runs",[])
-            runs.append({"question":question,"method":method,"model":model,"mode":provider,"status":"direct_answer","answer":data["answer"],"articles":0,"evidence":0,"llm_calls":data["usage"]["calls"],"input_tokens":data["usage"]["input_tokens"],"output_tokens":data["usage"]["output_tokens"],"latency_seconds":data["latency_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
+            runs.append({"question":question,"method":method,"provider":provider,"model":model,"mode":provider,"status":"direct_answer","answer":data["answer"],"articles":0,"evidence":0,"llm_calls":data["usage"]["calls"],"input_tokens":data["usage"]["input_tokens"],"output_tokens":data["usage"]["output_tokens"],"latency_seconds":data["latency_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget,"min_usable_evidence":min_evidence,"min_unique_evidence_pmids":min_sources}})
             del runs[:-100]
             progress.progress(1.0,text="Complete")
+            st.write(f"**Provider / model:** {provider} / `{model}`")
             st.subheader("Direct model answer"); st.write(data["answer"])
             st.caption("No PubMed retrieval or citation validation was used for this baseline.")
             st.json(data["usage"])
-            st.download_button("Download run JSON",json.dumps({"question":question,"method":method,"model":model,"answer":data["answer"],"usage":data["usage"],"latency_seconds":data["latency_seconds"]},indent=2),file_name="direct-llm-run.json",mime="application/json")
+            st.download_button("Download run JSON",json.dumps({"question":question,"method":method,"provider":provider,"model":model,"answer":data["answer"],"usage":data["usage"],"latency_seconds":data["latency_seconds"],"estimated_cost":None,"cost_status":"unavailable_no_provider_pricing_configured"},indent=2),file_name="direct-llm-run.json",mime="application/json")
             current=[r for r in runs if r["question"]==question and r["model"]==model and r["mode"]==provider]
             if len(current)>1:
                 st.subheader("Same-question comparison")
                 st.dataframe(pd.DataFrame([{**{k:r[k] for k in ("method","status","articles","evidence","llm_calls","latency_seconds")},"tokens":r["input_tokens"]+r["output_tokens"]} for r in current]),width="stretch",hide_index=True)
         else:
-            options={"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget,"mesh_expansion":mesh_enabled,"reflective_filtering":method!="Standard RAG (single query)","early_stopping":method!="No early stopping"}
+            options={"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget,"min_usable_evidence":min_evidence,"min_unique_evidence_pmids":min_sources,"mesh_expansion":mesh_enabled,"reflective_filtering":method!="Standard RAG (single query)","early_stopping":method!="No early stopping"}
             if method=="No self-critic refinement": options["refinement_rounds"]=0
             status.info("Stage 1/3 · self-critic query planning and PubMed search…"); progress.progress(.12,text="Searching PubMed")
             callback=lambda stage,value,text:(progress.progress(value,text=text),status.info(f"{stage.replace('_',' ').title()} · {text}"))
@@ -121,7 +124,7 @@ if run:
             else:
                 result=Reasoner(pubmed=shared_pubmed_client(),llm=llm,progress_callback=callback,**options).run(question,context)
             runs=st.session_state.setdefault("comparison_runs",[])
-            runs.append({"question":question,"method":method,"model":model if not mock else "mock","mode":"mock" if mock else provider,"status":result.status,"answer":result.answer,"articles":len(result.articles),"evidence":len(result.evidence),"llm_calls":result.trace["llm_usage"]["calls"],"input_tokens":result.trace["llm_usage"]["input_tokens"],"output_tokens":result.trace["llm_usage"]["output_tokens"],"latency_seconds":result.trace["duration_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
+            runs.append({"question":question,"method":method,"provider":"mock" if mock else provider,"model":model if not mock else "mock","mode":"mock" if mock else provider,"status":result.status,"answer":result.answer,"articles":len(result.articles),"evidence":result.trace.get("usable_evidence_excerpts",len(result.evidence)),"llm_calls":result.trace["llm_usage"]["calls"],"input_tokens":result.trace["llm_usage"]["input_tokens"],"output_tokens":result.trace["llm_usage"]["output_tokens"],"latency_seconds":result.trace["duration_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget,"min_usable_evidence":min_evidence,"min_unique_evidence_pmids":min_sources}})
             del runs[:-100]
             progress.progress(1.0,text="Run complete")
             tabs=st.tabs(["Final answer","Query refinement","Retrieved evidence","Retrieval process","Evaluation & comparison","Run details"])
@@ -133,7 +136,7 @@ if run:
                 if result.citations:
                     st.markdown("**PubMed references**")
                     for c in result.citations: st.markdown(f"[{c.pmid} · {c.title}]({c.url})")
-                if result.status=="answered": st.caption("These are model-extracted abstract passages; citation membership is not proof of entailment.")
+                if result.status=="answered": st.caption("Citations link to retrieved PubMed records and their accepted excerpts. Claim-level entailment is not automatically verified.")
             with tabs[1]:
                 st.markdown("**Final query**"); st.code(result.query)
                 st.markdown("**Query history**"); st.dataframe(pd.DataFrame(result.query_history),width="stretch",hide_index=True)
@@ -156,10 +159,16 @@ if run:
             with tabs[3]:
                 st.metric("Articles retrieved",len(result.articles)); st.metric("Accepted evidence excerpts",sum(e.aligned for e in result.evidence)); st.metric("Batches assessed",result.batches_processed)
                 st.write("**Termination reason:**",result.termination_reason)
+                st.write("**Provider / model:**",f"{result.trace.get('provider',result.trace.get('llm_mode'))} / {result.trace.get('model') or 'mock'}")
                 st.write("**PubMed requests:**",result.trace.get("pubmed_requests","unavailable"))
+                st.write("**PubMed cache hits:**",result.trace.get("pubmed_cache_hits","unavailable"))
+                st.write("**Unique search queries:**",len({entry["query"] for entry in result.trace.get("pubmed_searches",[])}))
+                st.write("**Accepted evidence / unique PMIDs:**",f"{result.trace.get('usable_evidence_excerpts',0)} / {result.trace.get('unique_evidence_pmids',0)}")
                 st.write("**LLM calls:**",result.trace["llm_usage"]["calls"])
                 st.write("**Input / output tokens:**",f"{result.trace['llm_usage']['input_tokens']} / {result.trace['llm_usage']['output_tokens']}")
-                st.write("**Estimated cost:** unavailable (no Groq price schedule configured)")
+                st.write("**Estimated cost:** unavailable (no provider pricing configured)")
+                if result.trace.get("pubmed_searches"):
+                    st.dataframe(pd.DataFrame(result.trace["pubmed_searches"]),width="stretch",hide_index=True)
             with tabs[4]:
                 st.write("Selected method:",method)
                 current=[r for r in runs if r["question"]==question and r["mode"]==("mock" if mock else provider) and r["model"]==(model if not mock else "mock")]

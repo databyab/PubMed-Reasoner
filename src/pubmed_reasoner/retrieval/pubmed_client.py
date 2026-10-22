@@ -10,7 +10,7 @@ BASE="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 class PubMedClient:
     def __init__(self, api_key: str | None = None, email: str | None = None, timeout: float | None = None, session=None):
         self.api_key=api_key if api_key is not None else settings.ncbi_api_key; self.email=email or settings.ncbi_email
-        self.timeout=timeout or settings.request_timeout; self.session=session or requests.Session(); self._last=0.0; self.requests=0; self._cache={}; self._article_cache={}; self._request_lock=threading.Lock()
+        self.timeout=timeout or settings.request_timeout; self.session=session or requests.Session(); self._last=0.0; self.requests=0; self._cache={}; self._article_cache={}; self._request_lock=threading.Lock(); self.search_log=[]; self.request_log=[]; self.cache_hits=0
     def _get(self, endpoint, params):
         # Shared Streamlit clients keep all sessions under NCBI's per-client request pace.
         with self._request_lock:
@@ -24,6 +24,10 @@ class PubMedClient:
         if self.api_key: params["api_key"]=self.api_key
         for attempt in range(4):
             self._last=time.monotonic(); self.requests+=1
+            safe_request={"endpoint":endpoint}
+            for name in ("term","retmax","id","datetype","mindate","maxdate"):
+                if name in params: safe_request[name]=params[name]
+            self.request_log.append(safe_request)
             try:
                 resp=self.session.get(BASE+endpoint,params=params,timeout=self.timeout)
                 if resp.status_code==429 or resp.status_code>=500:
@@ -39,12 +43,23 @@ class PubMedClient:
         raise RuntimeError("NCBI request retries exhausted")
     def search(self, query: str, max_results: int=20, date_from: str|None=None, date_to: str|None=None) -> list[str]:
         key=(query,max_results,date_from,date_to)
-        if key in self._cache: return list(self._cache[key])
+        if key in self._cache:
+            self.cache_hits+=1; self.search_log.append({"query":query,"max_results":max_results,"cache_hit":True,"result_count":len(self._cache[key])})
+            return list(self._cache[key])
+        # A cached, larger result set can safely serve a smaller request because
+        # ESearch returns IDs in the same relevance order. Never reuse it for a
+        # different query or date filter, and never treat a smaller set as complete.
+        larger=next((ids for (cached_query,cached_limit,cached_from,cached_to),ids in self._cache.items()
+                     if cached_query==query and cached_from==date_from and cached_to==date_to and cached_limit>=max_results),None)
+        if larger is not None:
+            result=list(larger[:max_results]); self._cache[key]=result; self.cache_hits+=1
+            self.search_log.append({"query":query,"max_results":max_results,"cache_hit":True,"result_count":len(result)})
+            return list(result)
         params={"db":"pubmed","term":query,"retmax":max_results,"retmode":"json","sort":"relevance"}
         if date_from: params.update(datetype="pdat",mindate=date_from,maxdate=date_to or date_from)
         import json
         payload=json.loads(self._get("esearch.fcgi",params)); ids=payload.get("esearchresult",{}).get("idlist",[])
-        self._cache[key]=ids; return ids
+        self._cache[key]=ids; self.search_log.append({"query":query,"max_results":max_results,"cache_hit":False,"result_count":len(ids)}); return ids
     def fetch_articles(self, pmids: list[str], query: str=""):
         if not pmids: return []
         key=tuple(pmids)

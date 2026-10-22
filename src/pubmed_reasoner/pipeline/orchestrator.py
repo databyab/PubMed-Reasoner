@@ -6,6 +6,8 @@ from ..config import settings
 from ..llm.factory import create_llm
 from ..llm.base import LLMError
 from ..models.schemas import QueryPlan,CriticFeedback,SufficiencyDecision,Evidence,EvidenceExtraction,AnswerDraft,ReasonResponse,Citation
+from .evidence_extractor import validate_evidence,usable_evidence,evidence_sufficiency_gate
+from .answer_generator import cited_pmids,citation_mapping_diagnostics
 from ..retrieval.pubmed_client import PubMedClient
 from ..retrieval.query_normalizer import normalize_query
 from ..retrieval.query_builder import build_query
@@ -13,12 +15,14 @@ from ..retrieval.query_builder import build_query
 LOG=logging.getLogger(__name__)
 
 class Reasoner:
-    def __init__(self,pubmed=None,llm=None,max_articles=None,batch_size=None,refinement_rounds=None,max_llm_calls=None,mesh_expansion=True,reflective_filtering=True,early_stopping=True,progress_callback=None):
+    def __init__(self,pubmed=None,llm=None,max_articles=None,batch_size=None,refinement_rounds=None,max_llm_calls=None,min_usable_evidence=None,min_unique_evidence_pmids=None,mesh_expansion=True,reflective_filtering=True,early_stopping=True,progress_callback=None):
         self.pubmed=pubmed or PubMedClient(); self.llm=llm or create_llm()
         self.max_articles=max_articles if max_articles is not None else settings.max_articles
         self.batch_size=batch_size if batch_size is not None else settings.batch_size
         self.refinement_rounds=settings.max_refinement_rounds if refinement_rounds is None else refinement_rounds
         self.max_llm_calls=max_llm_calls if max_llm_calls is not None else settings.max_llm_calls
+        self.min_usable_evidence=min_usable_evidence if min_usable_evidence is not None else settings.min_usable_evidence
+        self.min_unique_evidence_pmids=min_unique_evidence_pmids if min_unique_evidence_pmids is not None else settings.min_unique_evidence_pmids
         self.mesh_expansion=mesh_expansion; self.reflective_filtering=reflective_filtering; self.early_stopping=early_stopping
         self.progress_callback=progress_callback or (lambda *_:None)
         self.mesh=None
@@ -57,7 +61,8 @@ class Reasoner:
         return normalize_query(pattern.sub(replace,query)),unverified
     def run(self,question:str,context:str="") -> ReasonResponse:
         if not question.strip(): raise ValueError("Question cannot be empty")
-        started=time.monotonic(); trace={"run_id":str(uuid.uuid4()),"started_at":datetime.now(timezone.utc).isoformat(),"llm_mode":self.llm.mode,"model":getattr(self.llm,"model",None),"article_limit":self.max_articles,"batch_size":self.batch_size,"max_refinement_rounds":self.refinement_rounds,"max_llm_calls":self.max_llm_calls,"mesh_expansion":self.mesh_expansion,"reflective_filtering":self.reflective_filtering,"early_stopping":self.early_stopping}
+        started=time.monotonic(); request_start=getattr(self.pubmed,"requests",None); request_log_start=len(getattr(self.pubmed,"request_log",[])); search_log_start=len(getattr(self.pubmed,"search_log",[])); cache_start=getattr(self.pubmed,"cache_hits",None)
+        trace={"run_id":str(uuid.uuid4()),"started_at":datetime.now(timezone.utc).isoformat(),"provider":self.llm.mode,"llm_mode":self.llm.mode,"model":getattr(self.llm,"model",None),"article_limit":self.max_articles,"batch_size":self.batch_size,"max_refinement_rounds":self.refinement_rounds,"max_llm_calls":self.max_llm_calls,"min_usable_evidence":self.min_usable_evidence,"min_unique_evidence_pmids":self.min_unique_evidence_pmids,"mesh_expansion":self.mesh_expansion,"reflective_filtering":self.reflective_filtering,"early_stopping":self.early_stopping}
         history=[]; articles=[]; evidence=[]; assessments=[]; validation=[]; batches=0; termination=""
         plan=self._structured(QueryPlan,"Identify biomedical concepts and candidate MeSH descriptor names. Candidate phrases are unverified.",f"QUESTION: {question}\nCONTEXT: {context or 'None'}")
         self.progress_callback("query_plan",0.18,"Query plan generated")
@@ -82,6 +87,7 @@ class Reasoner:
         # Stage 2: process the relevance-ranked records in bounded batches.
         try: articles=self.pubmed.search_and_fetch(query,self.max_articles)
         except Exception as exc: termination=termination or f"pubmed_error:{type(exc).__name__}"; articles=[]
+        source_by_pmid={a.pmid:a for a in articles}
         if not articles: termination=termination or "no_pubmed_results"
         self.progress_callback("article_retrieval",0.42,f"Retrieved {len(articles)} article records")
         for start in range(0,len(articles),self.batch_size):
@@ -94,11 +100,10 @@ class Reasoner:
                         extracted=self._structured(EvidenceExtraction,"Assess relevance and extract a short verbatim passage from the abstract only. If it does not directly address the question, set aligned=false. Never invent text.",f"QUESTION: {question}\nPMID: {article.pmid}\nTITLE: {article.title}\nABSTRACT: {article.abstract}")
                     except LLMError as exc: termination=f"llm_budget_or_error:{exc}"; break
                     passage=extracted.passage.strip()
-                    # Verbatim membership is a hard guard against invented quotations.
-                    supported=bool(passage) and passage.casefold() in article.abstract.casefold()
                     rationale=extracted.rationale
-                    if extracted.aligned and not supported: rationale=(rationale+"; passage was not found verbatim in the source abstract").strip("; ")
-                    item=Evidence(pmid=article.pmid,title=article.title,passage=passage,aligned=extracted.aligned and supported,rationale=rationale)
+                    item=Evidence(pmid=article.pmid,title=article.title,passage=passage,aligned=extracted.aligned,rationale=rationale)
+                    if item.aligned and not validate_evidence(item,source_by_pmid):
+                        item.aligned=False; item.rationale=(rationale+"; passage did not match the retrieved PMID's abstract").strip("; ")
                     assessments.append(item)
                     if item.aligned: evidence.append(item)
                 else:
@@ -107,11 +112,14 @@ class Reasoner:
                     evidence.append(item); assessments.append(item)
             if termination.startswith("llm_budget_or_error"): break
             if self.reflective_filtering and evidence and self.early_stopping and self.llm.mode!="mock":
+                gate=evidence_sufficiency_gate(evidence,source_by_pmid,self.min_usable_evidence,self.min_unique_evidence_pmids)
+                if not gate["passed"]:
+                    history.append({"stage":"sufficiency_gate","batch":batches,**gate,"accepted_for_early_stop":False,"reason":"deterministic_minimum_not_met"})
+                    continue
                 try:
                     decision=self._structured(SufficiencyDecision,"Assess whether current evidence covers the major aspects. Consider independent articles and conflicting results. This is a model assessment, not proof.",f"QUESTION: {question}\nEVIDENCE: {json.dumps([e.model_dump() for e in evidence])}")
-                    independent=len({e.pmid for e in evidence})
-                    accepted=decision.is_sufficient and independent>=2
-                    history.append({"stage":"sufficiency","batch":batches,"model_says_sufficient":decision.is_sufficient,"independent_pmids":independent,"minimum_independent_sources":2,"accepted_for_early_stop":accepted,"covered_aspects":decision.covered_aspects,"missing_aspects":decision.missing_aspects,"rationale":decision.rationale})
+                    accepted=bool(gate["passed"] and decision.is_sufficient)
+                    history.append({"stage":"sufficiency","batch":batches,"model_says_sufficient":decision.is_sufficient,**gate,"accepted_for_early_stop":accepted,"covered_aspects":decision.covered_aspects,"missing_aspects":decision.missing_aspects,"rationale":decision.rationale})
                     if accepted: termination="model_assessed_sufficient_across_multiple_pmids"; break
                 except LLMError as exc: termination=f"llm_budget_or_error:{exc}"; break
         if not termination: termination="article_budget_exhausted" if len(articles)>=self.max_articles else "results_exhausted"
@@ -119,35 +127,44 @@ class Reasoner:
         self.progress_callback("answer_generation",0.88,"Preparing evidence-grounded response")
         answer="Insufficient evidence: no verified, relevant abstract passage supported a response."
         status="insufficient_evidence"
+        citation_draft_diagnostics=None
         if self.llm.mode=="mock":
             status="mock_demo"
             answer="Mock/demo run: retrieved records and query planning are shown below, but this mode does not make relevance or sufficiency judgments and does not produce a biomedical conclusion."
             evidence=[]
         elif evidence and self.reflective_filtering:
             try:
-                draft=self._structured(AnswerDraft,"Answer using only supplied evidence. Include inline [PMID:123] citations for claims, preserve uncertainty/conflicts, and explain limitations. Cite only source PMIDs supplied.",f"QUESTION: {question}\nEVIDENCE: {json.dumps([e.model_dump() for e in evidence])}")
-                allowed={e.pmid for e in evidence}; cited=set(draft.cited_pmids)
-                inline=set(re.findall(r"PMID\s*:\s*(\d+)",draft.answer))
-                if cited and cited.issubset(allowed) and inline and inline==cited:
+                evidence=[item for item in evidence if validate_evidence(item,source_by_pmid)]
+                draft=self._structured(AnswerDraft,"Answer using only supplied evidence. Attach an inline citation in exactly [PMID:123] format to each factual biomedical claim. The cited_pmids array must contain exactly the unique PMIDs used inline. Preserve uncertainty/conflicts and explain limitations. Cite only supplied PMIDs.",f"QUESTION: {question}\nEVIDENCE: {json.dumps([e.model_dump() for e in evidence])}")
+                allowed={e.pmid for e in evidence}; retrieved=set(source_by_pmid)
+                citation_draft_diagnostics=citation_mapping_diagnostics(draft.answer,draft.cited_pmids,allowed,retrieved)
+                if citation_draft_diagnostics["valid"]:
                     answer=draft.answer+"\n\nLimitations: "+("; ".join(draft.limitations) if draft.limitations else "Evidence is limited to retrieved abstracts and model-assessed excerpts.")
                     status="answered"
                 else:
-                    answer="Insufficient evidence: the generated answer did not map citations to the accepted evidence set."; evidence=[]
+                    answer="Insufficient evidence: the generated answer citations did not map to validated evidence from retrieved records. Accepted excerpts are retained for inspection."
             except LLMError as exc: termination=f"answer_generation_error:{exc}"
         elif evidence and not self.reflective_filtering:
             try:
-                draft=self._structured(AnswerDraft,"Answer using only these retrieved PubMed abstracts. Add inline [PMID:123] citations to each supported claim, preserve uncertainty, and never cite outside the supplied article set.",f"QUESTION: {question}\nABSTRACT CONTEXT: {json.dumps([{'pmid':e.pmid,'title':e.title,'abstract':e.passage} for e in evidence])}")
-                allowed={a.pmid for a in articles}; cited=set(draft.cited_pmids); inline=set(re.findall(r"PMID\s*:\s*(\d+)",draft.answer))
-                if cited and cited.issubset(allowed) and inline and inline==cited:
+                draft=self._structured(AnswerDraft,"Answer using only these retrieved PubMed abstracts. Attach an inline citation in exactly [PMID:123] format to each factual biomedical claim. The cited_pmids array must contain exactly the unique PMIDs used inline. Preserve uncertainty and never cite outside the supplied article set.",f"QUESTION: {question}\nABSTRACT CONTEXT: {json.dumps([{'pmid':e.pmid,'title':e.title,'abstract':e.passage} for e in evidence])}")
+                allowed={e.pmid for e in evidence if e.pmid in source_by_pmid}
+                citation_draft_diagnostics=citation_mapping_diagnostics(draft.answer,draft.cited_pmids,allowed,set(source_by_pmid))
+                if citation_draft_diagnostics["valid"]:
                     answer=draft.answer+"\n\nThis single-query RAG baseline did not apply reflective relevance filtering or evidence sufficiency checks."
                     status="raw_context_only"
-                else: answer="Insufficient evidence: the RAG draft did not contain valid PubMed citations."
+                else: answer="Insufficient evidence: the RAG draft citations did not map to supplied retrieved abstracts."
             except LLMError as exc: termination=f"answer_generation_error:{exc}"
-        source_by_pmid={a.pmid:a for a in articles}
-        cited_for_answer=set(re.findall(r"PMID\s*:\s*(\d+)",answer))
-        if status=="answered": evidence=[e for e in evidence if e.pmid in cited_for_answer] or evidence
+        cited_for_answer=cited_pmids(answer) if status in {"answered","raw_context_only"} else set()
+        allowed_for_answer={e.pmid for e in evidence if e.pmid in source_by_pmid}
+        cited_for_answer &= allowed_for_answer
         citations=[Citation(pmid=p,title=source_by_pmid[p].title,url=f"https://pubmed.ncbi.nlm.nih.gov/{p}/") for p in dict.fromkeys(cited_for_answer) if p in source_by_pmid]
-        trace.update({"llm_usage":self.llm.get_usage(),"pubmed_requests":getattr(self.pubmed,"requests",None),"duration_seconds":round(time.monotonic()-started,3),"termination_reason":termination,"meSH_taxonomy_loaded":self.mesh is not None})
+        request_end=getattr(self.pubmed,"requests",None)
+        request_delta=request_end-request_start if isinstance(request_end,int) and isinstance(request_start,int) else request_end
+        search_log=getattr(self.pubmed,"search_log",[])
+        request_log=getattr(self.pubmed,"request_log",[])
+        cache_end=getattr(self.pubmed,"cache_hits",None)
+        usable=usable_evidence(evidence,source_by_pmid)
+        trace.update({"llm_usage":self.llm.get_usage(),"pubmed_requests":request_delta,"pubmed_searches":list(search_log[search_log_start:]),"pubmed_request_log":list(request_log[request_log_start:]),"pubmed_cache_hits":cache_end-cache_start if isinstance(cache_end,int) and isinstance(cache_start,int) else None,"usable_evidence_excerpts":len(usable),"unique_evidence_pmids":len({e.pmid for e in usable}),"citation_validation":{"mode":"source_linked_membership_only","cited_pmids_in_retrieved_records":bool(citations) and all(c.pmid in source_by_pmid for c in citations),"claim_entailment_verified":False,"draft_diagnostics":citation_draft_diagnostics},"estimated_cost":None,"cost_status":"unavailable_no_provider_pricing_configured","duration_seconds":round(time.monotonic()-started,3),"termination_reason":termination,"meSH_taxonomy_loaded":self.mesh is not None})
         result=ReasonResponse(question=question,answer=answer,status=status,query=query,query_history=history,mesh_validation=validation,articles=articles,evidence=evidence,relevance_assessments=assessments,citations=citations,termination_reason=termination,batches_processed=batches,trace=trace)
         LOG.info("run=%s status=%s articles=%s accepted_evidence=%s batches=%s stop=%s",trace["run_id"],status,len(articles),len(evidence),batches,termination)
         self._save(result); return result
