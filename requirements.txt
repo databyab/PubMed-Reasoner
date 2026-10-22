@@ -1,0 +1,9 @@
+pydantic>=2.7,<3
+pydantic-settings>=2.2,<3
+requests>=2.31,<3
+groq>=0.20,<1
+streamlit>=1.45,<2
+pandas>=2.2,<3
+python-dotenv>=1.0,<2
+pytest>=8,<9
+-e .
