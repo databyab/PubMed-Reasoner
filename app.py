@@ -55,7 +55,13 @@ with st.sidebar:
     batch_size=st.slider("Articles per batch",1,10,min(settings.batch_size,10))
     max_articles=st.slider("Maximum articles",1,50,min(settings.max_articles,50))
     llm_budget=st.slider("Maximum Groq calls",1,60,min(settings.max_llm_calls,60))
-    mesh_enabled=st.checkbox("Validate and expand with local MeSH",True)
+    mesh_index_available=Path("data/mesh/descriptors.jsonl").exists()
+    mesh_enabled=st.checkbox(
+        "Validate and expand with local MeSH",
+        value=mesh_index_available,
+        disabled=not mesh_index_available,
+        help="Download the local MeSH descriptor index to enable this option.",
+    )
 
 st.subheader("Biomedical question answering")
 examples=["Are children with sleep deprivation at higher risk for obesity?","Do statins reduce atrial fibrillation after coronary artery bypass grafting?","Does vitamin D supplementation prevent respiratory infections?"]
@@ -163,5 +169,3 @@ if run:
     finally: progress.empty()
 
 st.divider()
-if not Path("data/mesh/descriptors.jsonl").exists():
-    st.info("Local MeSH taxonomy not initialized. Run `python scripts/download_mesh.py` once to enable descriptor validation and MeSH query expansion.")
