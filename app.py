@@ -8,14 +8,14 @@ import streamlit as st
 # Community Cloud stores credentials in st.secrets. Copy supported values into
 # the environment before importing the shared settings used by the CLI/app.
 try:
-    for _key in ("GROQ_API_KEY", "GROQ_MODEL", "LLM_MODE", "NCBI_EMAIL", "NCBI_API_KEY"):
+    for _key in ("GROQ_API_KEY", "GROQ_MODEL", "GEMINI_API_KEY", "GEMINI_MODEL", "LLM_MODE", "NCBI_EMAIL", "NCBI_API_KEY"):
         if _key not in os.environ and _key in st.secrets:
             os.environ[_key] = str(st.secrets[_key])
 except (FileNotFoundError, ImportError):
     pass
 
 from pubmed_reasoner.config import settings
-from pubmed_reasoner.llm.base import GroqLLM, MockLLM, LLMError
+from pubmed_reasoner.llm.base import GroqLLM, GeminiLLM, MockLLM, LLMError
 from pubmed_reasoner.pipeline.orchestrator import Reasoner
 from pubmed_reasoner.retrieval.pubmed_client import PubMedClient
 from pubmed_reasoner.baselines import run_baseline
@@ -32,6 +32,10 @@ st.warning("Research demonstration only. Not for diagnosis, treatment, or patien
 def load_active_models(api_key):
     return GroqLLM.active_models(api_key)
 
+@st.cache_data(ttl=300,show_spinner=False)
+def load_gemini_models(api_key):
+    return GeminiLLM.active_models(api_key)
+
 @st.cache_resource
 def shared_pubmed_client():
     return PubMedClient()
@@ -39,22 +43,26 @@ def shared_pubmed_client():
 with st.sidebar:
     st.header("Run configuration")
     mock=st.toggle("Mock/demo mode",value=settings.llm_mode=="mock",help="Uses deterministic synthetic control logic and never reports live model output.")
+    provider_name=st.selectbox("Model provider",["Groq","Gemini"],index=1 if settings.llm_mode=="gemini" else 0,disabled=mock)
+    provider=provider_name.lower()
     active_models=[]
     if not mock:
-        if not settings.groq_api_key:
-            st.error("GROQ_API_KEY is missing. Add it to .env; the key is never displayed.")
+        api_key=settings.gemini_api_key if provider=="gemini" else settings.groq_api_key
+        if not api_key:
+            st.error(f"{provider.upper()}_API_KEY is missing. Add it to your environment or Streamlit Secrets; the key is never displayed.")
         else:
-            try: active_models=load_active_models(settings.groq_api_key)
+            try: active_models=load_gemini_models(api_key) if provider=="gemini" else load_active_models(api_key)
             except LLMError as exc: st.error(str(exc))
     model=""
     if not mock and active_models:
-        default_idx=active_models.index(settings.groq_model) if settings.groq_model in active_models else 0
-        model=st.selectbox("Active Groq model",active_models,index=default_idx,help="Loaded from your authenticated Groq models endpoint at runtime.")
+        configured_model=settings.gemini_model if provider=="gemini" else settings.groq_model
+        default_idx=active_models.index(configured_model) if configured_model in active_models else 0
+        model=st.selectbox(f"Active {provider_name} model",active_models,index=default_idx,help="Loaded from the provider's authenticated models endpoint at runtime.")
     elif mock: st.info("MOCK MODEL MODE · no model conclusions; PubMed retrieval is still live")
     max_rounds=st.slider("Refinement rounds",0,5,min(settings.max_refinement_rounds,5))
     batch_size=st.slider("Articles per batch",1,10,min(settings.batch_size,10))
     max_articles=st.slider("Maximum articles",1,50,min(settings.max_articles,50))
-    llm_budget=st.slider("Maximum Groq calls",1,60,min(settings.max_llm_calls,60))
+    llm_budget=st.slider("Maximum model calls",1,60,min(settings.max_llm_calls,60))
     mesh_index_available=Path("data/mesh/descriptors.jsonl").exists()
     mesh_enabled=st.checkbox(
         "Validate and expand with local MeSH",
@@ -72,27 +80,32 @@ def set_example():
 st.selectbox("Example questions",["Choose an example…"]+examples,key="example_question",on_change=set_example)
 question=st.text_area("Research question",height=95,placeholder="Enter a biomedical research question",key="research_question")
 context=st.text_input("Optional context or task requirement",placeholder="e.g., answer yes/no and summarize evidence")
-method=st.selectbox("Pipeline / baseline",["Full PubMed Reasoner","Standard RAG (single query)","No self-critic refinement","No early stopping","Self-reflection (post-hoc review)","Direct Groq LLM"])
+method=st.selectbox("Pipeline / baseline",["Full PubMed Reasoner","Standard RAG (single query)","No self-critic refinement","No early stopping","Self-reflection (post-hoc review)","Direct LLM"])
 run=st.button("Run research pipeline",type="primary",disabled=not question.strip() or (not mock and (not active_models or not model)))
 
 if run:
     progress=st.progress(0,text="Preparing configuration…")
     status=st.empty()
     try:
-        llm=MockLLM() if mock else GroqLLM(settings.groq_api_key or "",model,settings.request_timeout,available_models=active_models)
-        if method=="Direct Groq LLM":
-            if mock: raise LLMError("Direct LLM baseline requires live Groq; switch off mock mode.")
-            status.info("Running direct-answer baseline…"); progress.progress(.3,text="Groq direct answer")
+        if mock:
+            llm=MockLLM()
+        elif provider=="gemini":
+            llm=GeminiLLM(settings.gemini_api_key or "",model,settings.request_timeout,available_models=active_models)
+        else:
+            llm=GroqLLM(settings.groq_api_key or "",model,settings.request_timeout,available_models=active_models)
+        if method=="Direct LLM":
+            if mock: raise LLMError("Direct LLM baseline requires a live model; switch off mock mode.")
+            status.info("Running direct-answer baseline…"); progress.progress(.3,text=f"{provider_name if not mock else 'Mock'} direct answer")
             data=run_baseline("direct_llm",question,llm=llm,context=context)
             runs=st.session_state.setdefault("comparison_runs",[])
-            runs.append({"question":question,"method":method,"model":model,"mode":"groq","status":"direct_answer","answer":data["answer"],"articles":0,"evidence":0,"llm_calls":data["usage"]["calls"],"input_tokens":data["usage"]["input_tokens"],"output_tokens":data["usage"]["output_tokens"],"latency_seconds":data["latency_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
+            runs.append({"question":question,"method":method,"model":model,"mode":provider,"status":"direct_answer","answer":data["answer"],"articles":0,"evidence":0,"llm_calls":data["usage"]["calls"],"input_tokens":data["usage"]["input_tokens"],"output_tokens":data["usage"]["output_tokens"],"latency_seconds":data["latency_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
             del runs[:-100]
             progress.progress(1.0,text="Complete")
             st.subheader("Direct model answer"); st.write(data["answer"])
             st.caption("No PubMed retrieval or citation validation was used for this baseline.")
             st.json(data["usage"])
             st.download_button("Download run JSON",json.dumps({"question":question,"method":method,"model":model,"answer":data["answer"],"usage":data["usage"],"latency_seconds":data["latency_seconds"]},indent=2),file_name="direct-llm-run.json",mime="application/json")
-            current=[r for r in runs if r["question"]==question and r["model"]==model and r["mode"]=="groq"]
+            current=[r for r in runs if r["question"]==question and r["model"]==model and r["mode"]==provider]
             if len(current)>1:
                 st.subheader("Same-question comparison")
                 st.dataframe(pd.DataFrame([{**{k:r[k] for k in ("method","status","articles","evidence","llm_calls","latency_seconds")},"tokens":r["input_tokens"]+r["output_tokens"]} for r in current]),width="stretch",hide_index=True)
@@ -108,13 +121,13 @@ if run:
             else:
                 result=Reasoner(pubmed=shared_pubmed_client(),llm=llm,progress_callback=callback,**options).run(question,context)
             runs=st.session_state.setdefault("comparison_runs",[])
-            runs.append({"question":question,"method":method,"model":model if not mock else "mock","mode":"mock" if mock else "groq","status":result.status,"answer":result.answer,"articles":len(result.articles),"evidence":len(result.evidence),"llm_calls":result.trace["llm_usage"]["calls"],"input_tokens":result.trace["llm_usage"]["input_tokens"],"output_tokens":result.trace["llm_usage"]["output_tokens"],"latency_seconds":result.trace["duration_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
+            runs.append({"question":question,"method":method,"model":model if not mock else "mock","mode":"mock" if mock else provider,"status":result.status,"answer":result.answer,"articles":len(result.articles),"evidence":len(result.evidence),"llm_calls":result.trace["llm_usage"]["calls"],"input_tokens":result.trace["llm_usage"]["input_tokens"],"output_tokens":result.trace["llm_usage"]["output_tokens"],"latency_seconds":result.trace["duration_seconds"],"budgets":{"max_articles":max_articles,"batch_size":batch_size,"refinement_rounds":max_rounds,"max_llm_calls":llm_budget}})
             del runs[:-100]
             progress.progress(1.0,text="Run complete")
             tabs=st.tabs(["Final answer","Query refinement","Retrieved evidence","Retrieval process","Evaluation & comparison","Run details"])
             with tabs[0]:
                 st.subheader("Answer")
-                if result.status=="mock_demo": st.info("MOCK/DEMO RESULT — this is not a live Groq experiment and includes no scientific conclusion.")
+                if result.status=="mock_demo": st.info("MOCK/DEMO RESULT — this is not a live model experiment and includes no scientific conclusion.")
                 elif result.status!="answered": st.warning(result.status.replace("_"," ").title())
                 st.write(result.answer)
                 if result.citations:
@@ -149,7 +162,7 @@ if run:
                 st.write("**Estimated cost:** unavailable (no Groq price schedule configured)")
             with tabs[4]:
                 st.write("Selected method:",method)
-                current=[r for r in runs if r["question"]==question and r["mode"]==("mock" if mock else "groq") and r["model"]==(model if not mock else "mock")]
+                current=[r for r in runs if r["question"]==question and r["mode"]==("mock" if mock else provider) and r["model"]==(model if not mock else "mock")]
                 st.info("Run additional methods on this same question and model to build a side-by-side comparison. Accuracy and macro F1 remain unavailable without labeled benchmark evaluation.")
                 st.dataframe(pd.DataFrame([{**{k:r[k] for k in ("method","status","articles","evidence","llm_calls","latency_seconds")},"tokens":r["input_tokens"]+r["output_tokens"],"accuracy":"unavailable","macro F1":"unavailable","budgets":json.dumps(r["budgets"])} for r in current]),width="stretch",hide_index=True)
                 if len(current)>1:

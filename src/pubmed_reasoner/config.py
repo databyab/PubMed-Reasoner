@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     llm_mode: str = "mock"
     groq_api_key: str | None = None
     groq_model: str = ""
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.5-flash-lite"
     ncbi_email: str | None = None
     ncbi_api_key: str | None = None
     log_level: str = "INFO"
@@ -19,10 +21,12 @@ class Settings(BaseSettings):
     request_timeout: float = Field(default=30, gt=0, le=180)
     @model_validator(mode="after")
     def provider_config(self):
-        if self.llm_mode not in {"mock", "groq"}:
-            raise ValueError("LLM_MODE must be mock or groq")
+        if self.llm_mode not in {"mock", "groq", "gemini"}:
+            raise ValueError("LLM_MODE must be mock, groq, or gemini")
         if self.llm_mode == "groq" and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY is required in Groq mode")
+        if self.llm_mode == "gemini" and not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required in Gemini mode")
         return self
 
 settings = Settings()

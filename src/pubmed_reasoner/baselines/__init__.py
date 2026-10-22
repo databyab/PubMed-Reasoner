@@ -1,4 +1,4 @@
-"""Simple baseline runners sharing the selected Groq SDK client and budgets."""
+"""Simple baseline runners sharing the selected model client and budgets."""
 from ..pipeline.orchestrator import Reasoner
 from ..models.schemas import AnswerDraft,Citation
 from ..llm.base import LLMError

@@ -1,6 +1,7 @@
-"""Groq-only model integration, plus a visibly synthetic test/offline provider."""
+"""Groq and Gemini model integrations, plus a synthetic test/offline provider."""
 from typing import Type, TypeVar
 import re
+import json
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
@@ -69,6 +70,77 @@ class GroqLLM(LLMProvider):
             return schema.model_validate_json(result.choices[0].message.content or "")
         except Exception as exc:
             raise LLMError(f"Groq structured {schema.__name__} request/validation failed: {type(exc).__name__}") from exc
+
+class GeminiLLM(LLMProvider):
+    """Google Gemini API adapter implementing the shared LLMProvider interface."""
+    mode="gemini"
+    def __init__(self,api_key: str,model: str,timeout: float=60,available_models=None):
+        super().__init__()
+        if not api_key: raise LLMError("GEMINI_API_KEY is not configured")
+        model=model.strip()
+        if not model: raise LLMError("Select an active Gemini model in the sidebar or set GEMINI_MODEL")
+        try:
+            from google import genai
+            self.client=genai.Client(api_key=api_key)
+        except Exception as exc: raise LLMError(f"Could not initialize Gemini SDK: {type(exc).__name__}") from exc
+        active=available_models if available_models is not None else self.active_models(api_key)
+        if model not in active: raise LLMError("Configured model is not in the currently available Gemini model list")
+        self.model=model
+    @classmethod
+    def active_models(cls,api_key: str):
+        """List models available to this key that support text generation."""
+        try:
+            from google import genai
+            client=genai.Client(api_key=api_key)
+            models=[]
+            for item in client.models.list():
+                actions=getattr(item,"supported_actions",None) or []
+                name=getattr(item,"name","")
+                model_id=name.removeprefix("models/")
+                if "generateContent" in actions and model_id:
+                    models.append(model_id)
+            return sorted(set(models))
+        except Exception as exc: raise LLMError(f"Could not load available Gemini models ({type(exc).__name__})") from None
+    @staticmethod
+    def _response_schema(schema:Type[T]):
+        """Build Gemini-compatible JSON schema for this app's Pydantic outputs."""
+        result=schema.model_json_schema()
+        # Gemini structured output rejects free-form maps (additionalProperties).
+        # QueryPlan.term_rationales is optional presentation metadata, so omit it;
+        # Pydantic supplies its empty-dict default when validating the response.
+        properties=result.get("properties",{})
+        if schema.__name__=="QueryPlan":
+            properties.pop("term_rationales",None)
+            result["required"]=[name for name in result.get("required",[]) if name!="term_rationales"]
+        def clean(value):
+            if isinstance(value,dict):
+                value.pop("additionalProperties",None)
+                for child in value.values(): clean(child)
+            elif isinstance(value,list):
+                for child in value: clean(child)
+        clean(result)
+        return result
+    def _generate(self,system,prompt,schema=None):
+        from google.genai import types
+        config={"system_instruction":system,"temperature":0}
+        if schema is not None:
+            config.update(response_mime_type="application/json",response_schema=self._response_schema(schema))
+        self.calls+=1
+        try:
+            result=self.client.models.generate_content(model=self.model,contents=prompt,config=types.GenerateContentConfig(**config))
+            usage=getattr(result,"usage_metadata",None)
+            if usage:
+                self.input_tokens+=getattr(usage,"prompt_token_count",0) or 0
+                self.output_tokens+=getattr(usage,"candidates_token_count",0) or 0
+            return result.text or ""
+        except Exception as exc:
+            raise LLMError(f"Gemini request failed ({type(exc).__name__}): {exc}") from exc
+    def generate_text(self,system: str,prompt: str)->str:
+        return self._generate(system,prompt)
+    def generate_structured_output(self,schema:Type[T],system:str,prompt:str)->T:
+        raw=self._generate(system,prompt,schema)
+        try: return schema.model_validate_json(raw)
+        except Exception as exc: raise LLMError(f"Gemini structured {schema.__name__} response validation failed") from exc
 
 class MockLLM(LLMProvider):
     """Synthetic provider for tests/demo. Never represents a model experiment."""

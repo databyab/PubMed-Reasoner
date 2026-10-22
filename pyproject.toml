@@ -7,7 +7,7 @@ name = "pubmed-reasoner-reproduction"
 version = "0.1.0"
 description = "Educational, evidence-grounded biomedical QA research prototype"
 requires-python = ">=3.10"
-dependencies = ["pydantic>=2.7,<3", "pydantic-settings>=2.2,<3", "requests>=2.31,<3", "groq>=0.20,<1", "streamlit>=1.45,<2", "pandas>=2.2,<3", "python-dotenv>=1.0,<2"]
+dependencies = ["pydantic>=2.7,<3", "pydantic-settings>=2.2,<3", "requests>=2.31,<3", "groq>=0.20,<1", "google-genai>=1.0,<2", "streamlit>=1.45,<2", "pandas>=2.2,<3", "python-dotenv>=1.0,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]

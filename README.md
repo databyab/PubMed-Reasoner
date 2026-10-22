@@ -37,17 +37,19 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Add your Groq key to `.env` to use live model reasoning:
+Add the key for the provider you want to use to `.env`:
 
 ```dotenv
 GROQ_API_KEY=your-key
 GROQ_MODEL=openai/gpt-oss-120b
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.5-flash-lite
 LLM_MODE=mock
 NCBI_EMAIL=you@example.com
 NCBI_API_KEY=
 ```
 
-`GROQ_MODEL` is optional in the UI: with a key present, the app fetches the active model list and lets you choose a model. `LLM_MODE=mock` is the safe default; switch off **Mock/demo mode** in the sidebar to run live Groq calls. Mock mode can demonstrate the interface and retrieve PubMed records, but it does not make real relevance or sufficiency judgments or generate a biomedical conclusion. NCBI credentials are optional; `NCBI_EMAIL` and `NCBI_API_KEY` are recommended for responsible API use and higher request limits.
+The sidebar lets you select Groq or Gemini and loads the models available to the configured API key. Set `GROQ_API_KEY` for Groq or `GEMINI_API_KEY` for Gemini; the matching model variable is optional in the UI. `LLM_MODE=mock` is the safe default; switch off **Mock/demo mode** and select a provider to run live model calls. For CLI use, set `LLM_MODE=groq` with `GROQ_MODEL`, or `LLM_MODE=gemini` with `GEMINI_MODEL`. Mock mode can demonstrate the interface and retrieve PubMed records, but it does not make real relevance or sufficiency judgments or generate a biomedical conclusion. NCBI credentials are optional; `NCBI_EMAIL` and `NCBI_API_KEY` are recommended for responsible API use and higher request limits.
 
 Start the app:
 
@@ -70,13 +72,15 @@ python scripts/download_mesh.py
    ```toml
    GROQ_API_KEY = "your-key"
    GROQ_MODEL = "openai/gpt-oss-120b"
+   GEMINI_API_KEY = "your-gemini-key"
+   GEMINI_MODEL = "gemini-3.5-flash-lite"
    LLM_MODE = "mock"
    NCBI_EMAIL = "you@example.com"
    ```
 
-   The app reads these values from Community Cloud secrets. Keep `LLM_MODE="mock"` if you want the demo to start in mock mode; turn off the mock toggle in the app to use Groq. Leave `NCBI_API_KEY` out if you do not have one.
+   The app reads these values from Community Cloud secrets. Add either or both provider keys. `gemini-3.5-flash-lite` is the preselected Gemini model for lower-cost, higher-volume use; choose another available ID in the sidebar if desired. Keep `LLM_MODE="mock"` if you want the demo to start in mock mode; turn off the mock toggle and select Groq or Gemini to use a live provider. Leave `NCBI_API_KEY` out if you do not have one.
 
-4. Deploy. No PubMed corpus or MeSH download is required. The app calls PubMed and, when live mode is selected, Groq at runtime. Without `GROQ_API_KEY`, use mock/demo mode.
+4. Deploy. No PubMed corpus or MeSH download is required. The app calls PubMed and, when live mode is selected, the configured Groq or Gemini provider at runtime. Without the selected provider's API key, use mock/demo mode.
 
 See Streamlit's [deployment guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy) and [secrets guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management) for current steps.
 
@@ -88,11 +92,11 @@ See Streamlit's [deployment guide](https://docs.streamlit.io/deploy/streamlit-co
 
 There is no vector database or embedding-based nearest-neighbor search. PubMed performs the initial matching against its own index. The optional MeSH JSONL file is a terminology index, not a vector store.
 
-A run's Groq calls vary with the number of refinement rounds, abstracts assessed, sufficiency checks, and whether an answer is generated. **Maximum Groq calls** caps the run. The Run details view reports actual calls and token counts. PubMed requests are separate from LLM calls.
+A run's model calls vary with the number of refinement rounds, abstracts assessed, sufficiency checks, and whether an answer is generated. **Maximum model calls** caps the run. The Run details view reports actual calls and token counts. PubMed requests are separate from model calls.
 
 ## Modes and comparisons
 
-The sidebar lets you select the Full Reasoner, Standard RAG (single query), no self-critic refinement, no early stopping, post-hoc self-reflection, or Direct Groq LLM. Run methods on the same question and model to compare their outputs and resource use. Accuracy and macro F1 are shown only when supported by a labeled evaluation; the interactive comparison does not estimate them.
+The sidebar lets you select the Full Reasoner, Standard RAG (single query), no self-critic refinement, no early stopping, post-hoc self-reflection, or Direct LLM. Run methods on the same question and provider/model to compare their outputs and resource use. Accuracy and macro F1 are shown only when supported by a labeled evaluation; the interactive comparison does not estimate them. The included PubMedQA evaluation scripts currently support Groq only.
 
 ## Benchmark evaluation
 
